@@ -69,7 +69,7 @@ def extractData(deviceId, data):
     byteNumAdvWeightL1 = 20 - offset
     byteNumAdvWeightL2 = 21 - offset
     byteNumAdvWeightR1 = 22 - offset
-    byteNumAdvWeightR2 = 22 - offset
+    byteNumAdvWeightR2 = 23 - offset
     byteNumAdvHumidity = 24 - offset
     byteNumAdvWeightL2SM_Time0 = 25 - offset
     byteNumAdvWeightL2SM_Time1 = 26 - offset
@@ -166,4 +166,4 @@ class ScanDelegate(DefaultDelegate):
             processData(dev)
 
 scanner = Scanner().withDelegate(ScanDelegate())
-devices = scanner.scan(15.0)
+devices = scanner.scan(30.0)
