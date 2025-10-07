@@ -1,0 +1,23 @@
+mqtt:
+  sensor:
+    - name: Broodminder Scale xx:xx:xx Temperature
+      unique_id: broodminder_scale_xx_xx_xx_temperature
+      state_topic: "broodminder/xx:xx:xx/infojson"
+      unit_of_measurement: "°C"
+      device_class: temperature
+      state_class: measurement
+      value_template: "{{ value_json.temperatureDegreesC }}"
+    - name: Broodminder Scale xx:xx:xx Weight
+      unique_id: broodminder_scale_xx:xx:xx_weight
+      state_topic: "broodminder/xx:xx:xx/infojson"
+      unit_of_measurement: "kg"
+      device_class: weight
+      state_class: measurement
+      value_template: "{{ value_json.realTimeWeight_kg }}"
+    - name: Broodminder Scale xx:xx:xx Battery
+      unique_id: broodminder_scale_xx:xx:xx_battery
+      state_topic: "broodminder/xx:xx:xx/infojson"
+      unit_of_measurement: "%"
+      device_class: battery
+      state_class: measurement
+      value_template: "{{ value_json.batteryPercent }}"
