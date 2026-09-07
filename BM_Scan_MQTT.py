@@ -5,6 +5,8 @@
 from bluepy.btle import Scanner, DefaultDelegate
 import time
 import json
+import sqlite3
+from datetime import datetime
 import paho.mqtt
 import paho.mqtt.client as mqtt
 from dotenv import dotenv_values
@@ -18,27 +20,74 @@ mq_topic_prefix = config["mq_topic_prefix"]
 mq_username = config["mq_username"]
 mq_password = config["mq_password"]
 
+# Local SQLite Queue settings
+DB_NAME = "offline_queue.db"
 
-def SendToMQTT(deviceId, json):
+def init_db():
+    """Initializes the local SQLite database for offline message queueing."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS pending_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT,
+            payload TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-    #print("SendToMQTT")
+# Initialize the queue database on startup
+init_db()
 
-    def on_publish(client, userdata, mid, reason_code, properties):
-        # reason_code and properties will only be present in MQTTv5. It's always unset in MQTTv3
+
+def save_to_local_queue(deviceId, json_data):
+    """Saves a failed message to the local SQLite queue."""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO pending_messages (device_id, payload) VALUES (?, ?)", (deviceId, json_data))
+        conn.commit()
+        conn.close()
+        print("  [Offline Storage] Message saved locally due to transmission failure.")
+    except Exception as e:
+        print(f"  [Error] Failed to save message locally: {e}")
+
+
+def flush_local_queue(mqttc, topic_prefix):
+    """Retransmits all locally stored offline messages when connection is restored."""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, device_id, payload FROM pending_messages ORDER BY id ASC")
+        rows = cursor.fetchall()
+        
+        if rows:
+            print(f"  [Offline Queue] Attempting to retransmit {len(rows)} pending offline message(s)...")
+            for row_id, device_id, payload in rows:
+                try:
+                    msg_info = mqttc.publish(topic_prefix + "/" + device_id + "/infojson", payload, qos=2, retain=True)
+                    msg_info.wait_for_publish(timeout=5.0)
+                    
+                    # Remove from queue once successfully published
+                    cursor.execute("DELETE FROM pending_messages WHERE id = ?", (row_id,))
+                    conn.commit()
+                    print(f"  [Offline Queue] Successfully retransmitted queued message ID {row_id}")
+                except Exception as e:
+                    print(f"  [Offline Queue] Retransmission interrupted for ID {row_id}: {e}")
+                    break  # Stop flushing if network drops again
+        conn.close()
+    except Exception as e:
+        print(f"  [Error] Error flushing local queue: {e}")
+
+
+def SendToMQTT(deviceId, json_data):
+
+    def on_publish(client, userdata, mid, reason_code=None, properties=None):
         try:
             userdata.remove(mid)
         except KeyError:
-            print("on_publish() is called with a mid not present in unacked_publish")
-            print("This is due to an unavoidable race-condition:")
-            print("* publish() return the mid of the message sent.")
-            print("* mid from publish() is added to unacked_publish by the main thread")
-            print("* on_publish() is called by the loop_start thread")
-            print("While unlikely (because on_publish() will be called after a network round-trip),")
-            print(" this is a race-condition that COULD happen")
-            print("")
-            print("The best solution to avoid race-condition is using the msg_info from publish()")
-            print("We could also try using a list of acknowledged mid rather than removing from pending list,")
-            print("but remember that mid could be re-used !")
+            pass
 
     unacked_publish = set()
 
@@ -47,33 +96,40 @@ def SendToMQTT(deviceId, json):
         mqttc.on_publish = on_publish
     else:
         mqttc = mqtt.Client()
+        mqttc.on_publish = on_publish
 
-    mqttc.username_pw_set(username=mq_username,password=mq_password)
-
+    mqttc.username_pw_set(username=mq_username, password=mq_password)
     mqttc.user_data_set(unacked_publish)
-    print("Connecting to MQTT Broker")
-    mqttc.connect(mq_broker_ip, mq_port, 60)
-    mqttc.loop_start()
-    print("MQTT Loop Start")
 
-    # Wait for all message to be published
-    while len(unacked_publish):
-        time.sleep(0.1)
+    try:
+        print("Connecting to MQTT Broker")
+        mqttc.connect(mq_broker_ip, mq_port, 60)
+        mqttc.loop_start()
+        print("MQTT Loop Start")
 
-    # Send over MQTT
-    msg_info = mqttc.publish(mq_topic_prefix+"/"+deviceId+"/infojson", json, qos=2, retain=True)
-    unacked_publish.add(msg_info.mid)
+        # 1. Flush any old offline messages first
+        flush_local_queue(mqttc, mq_topic_prefix)
 
-    # Due to race-condition described above, the following way to wait for all publish is safer
-    msg_info.wait_for_publish()
+        # 2. Publish current message
+        msg_info = mqttc.publish(mq_topic_prefix + "/" + deviceId + "/infojson", json_data, qos=2, retain=True)
+        unacked_publish.add(msg_info.mid)
 
-    mqttc.disconnect()
-    mqttc.loop_stop()
+        msg_info.wait_for_publish(timeout=5.0)
+
+        mqttc.disconnect()
+        mqttc.loop_stop()
+        print("MQTT transmission successful.")
+
+    except Exception as e:
+        print(f"  [MQTT Error] Connection or publishing failed: {e}")
+        save_to_local_queue(deviceId, json_data)
+        try:
+            mqttc.loop_stop()
+        except:
+            pass
 
 
 def byte(str, byteNum):
-    # https://stackoverflow.com/questions/5649407/hexadecimal-string-to-byte-array-in-python
-    # Trapping for 'str' passed as 'None'
     if (str == None):
         return ''
     return str[byteNum * 2] + str[byteNum * 2 + 1]
@@ -83,7 +139,6 @@ def checkBM(data):
     check = False
     byteCheck = 0
     BMIFLLC = str("8d02")
-    # print (byte(data,byteCheck))
     if (BMIFLLC == byte(data, byteCheck) + byte(data, byteCheck + 1)):
         print("  Found BroodMinder device")
         check = True
@@ -115,31 +170,14 @@ def extractData(deviceId, data):
     byteNumAdvRealtimeTotalWeight_SwarmState = 29 - offset
     byteNumAdvRealtimeTotalWeight = 30 - offset
 
-    # BM Models (as of early 2024)
-
-    # T (41, 47)    # TH (42, 56)
-    # W (43, 57)    # W3/W4 (49)
-    # SubHub (52)    # Hub (54)
-    # DIY (58)    # BeeDar (63)
-
-    # Current sample number from the device.
     sampleNumber = int(byte(data, byteNumAdvElapsed_2b), 16) + int(byte(data, byteNumAdvElapsed_2), 16)
-
-    # Model
     modelNumber = int(byte(data, byteNumAdvdeviceModelIFllc_1), 16)
-
-    # Version
     versionNumber = str(int(byte(data, byteNumAdvDeviceVersionMajor_1), 16)) + "." + str(int(byte(data, byteNumAdvDeviceVersionMinor_1), 16))
 
     print("  Model Number = {}, Version = {}, Sample = {}".format(modelNumber, versionNumber, sampleNumber))
 
-    #defaults for non weigth devices
     realTimeWeight_lb = 0
     realTimeWeight_kg = 0
-
-#    if modelNumber == 41 or modelNumber == 42 or modelNumber == 43:
-#        continue
-
 
     if modelNumber == 49 or modelNumber == 57 or modelNumber == 58:
         weightR = (int(byte(data, byteNumAdvWeightL2), 16) * 256 + int(byte(data, byteNumAdvWeightL1), 16)) - 32767
@@ -156,38 +194,29 @@ def extractData(deviceId, data):
         weightScaledL2_lb = float(weightL2 / 100)
         weightScaledL2_kg = weightScaledL2_lb * lbtokg
 
-    #    print("  Scale R1 kg = {}".format(weightScaledR_kg))
-    #    print("  Scale R2 kg = {}".format(weightScaledR2_kg))
-    #    print("  Scale L1 kg = {}".format(weightScaledL_kg))
-    #    print("  Scale L2 kg = {}".format(weightScaledL2_kg))
-    #    print("  Scaled Total kg = {}".format(weightScaledR_kg+weightScaledR2_kg+weightScaledL_kg+weightScaledL2_kg))
-
         realTimeWeight_lb = ((int(byte(data, byteNumAdvRealtimeTotalWeight), 16) * 256 + int(byte(data, byteNumAdvRealtimeTotalWeight_SwarmState), 16) - 32767 ) / 100)
         realTimeWeight_kg = round(realTimeWeight_lb * lbtokg, 2)
         realTimeWeight_lb = round(realTimeWeight_lb, 2)
 
-    #    print("  realTimeWeight kg = {}".format(realTimeWeight_kg))
-
     batteryPercent = int(byte(data, byteNumAdvBattery_1V2), 16)
 
-    # Temps
     temperatureDegreesC = int(byte(data, byteNumAdvTemperature_2b) + byte(data, byteNumAdvTemperature_2), 16)
     temperatureDegreesC = (float(temperatureDegreesC) - 5000) / 100
     temperatureDegreesF = round((temperatureDegreesC * 9 / 5) + 32, 2)
     temperatureDegreesC = round(temperatureDegreesC, 2)
 
-    # Humidity (0 for 41/47/49/52)
     if modelNumber == 41 or modelNumber == 47 or modelNumber == 49 or modelNumber == 52:
         humidityPercent = 0
     else:
         humidityPercent = int(byte(data, byteNumAdvHumidity))
 
-    #print("    Weight = {} kg {} lb, TemperatureC = {} C {} F, Humidity = {} %, Battery = {} %".format(realTimeWeight_kg, realTimeWeight_lb, temperatureDegreesC, temperatureDegreesF, humidityPercent, batteryPercent))
+    # Generate an ISO timestamp for when this reading was scanned
+    current_timestamp = datetime.now().isoformat()
 
-    data = {"sampleNumber": sampleNumber,
+    data = {"timestamp": current_timestamp,
+            "sampleNumber": sampleNumber,
             "modelNumber": modelNumber,
             "versionNumber": versionNumber,
-            "sampleNumber": sampleNumber,
             "batteryPercent": batteryPercent,
             "realTimeWeight_lb": realTimeWeight_lb,
             "realTimeWeight_kg": realTimeWeight_kg,
@@ -196,7 +225,6 @@ def extractData(deviceId, data):
             "humidityPercent": humidityPercent
             }
 
-    #print (data)
     json_data = json.dumps(data)
     SendToMQTT(deviceId, json_data)
 
@@ -207,11 +235,9 @@ def processData(pdev):
         for (adtype, desc, value) in pdev.getScanData():
             print("    %s = %s" % (desc, value))
 
-            # Trap for the BroodMinder ID
             if (desc == "Complete Local Name"):
                 extractData(value, pdev.getValueText(255))
 
-            # Trap for evertyhing
             extractData(value, pdev.getValueText(255))
 
 
@@ -221,11 +247,8 @@ class ScanDelegate(DefaultDelegate):
 
     def handleDiscovery(self, dev, isNewDev, isNewData):
         if isNewDev:
-            # print("  Discovered device {}".format(dev.addr))
             processData(dev)
-
         elif isNewData:
-            # print("  Received data from {}".format(dev.addr))
             processData(dev)
 
 scanner = Scanner().withDelegate(ScanDelegate())
