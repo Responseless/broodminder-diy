@@ -1,1 +1,1 @@
-Broodminder sensor scanner with MQQT
+Broodminder sensor scanner with MQTT
